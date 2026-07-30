@@ -20,6 +20,9 @@ from typing import TypedDict
 
 from openai import OpenAI
 
+from costhack.contract import ACTIONS, RISKS
+from costhack.schema import Action, Case, Risk
+
 VERIFY_MODEL = "amazon/nova-lite"
 _MAX_ATTEMPTS = 3
 _RETRY_DELAY_SECONDS = 0.5
@@ -104,4 +107,93 @@ def verify(
     return {
         "confirmed": bool(data.get("confirmed")),
         "explanation": str(data.get("explanation") or "Confirmed by verification model.").strip(),
+    }
+
+
+_BROAD_SYSTEM_PROMPT = (
+    "You are a fallback safety net for a release-gate reviewer whose fast pattern "
+    "detectors found nothing suspicious in this case. Read the whole case and decide "
+    "if there is one clear, evidence-backed defect a competent reviewer would flag. "
+    "Only report something if you can quote it verbatim from the supplied context - "
+    "never invent or paraphrase evidence. Valid categories: authorization, "
+    "authentication, data_integrity, data_loss, dependency, idempotency, injection, "
+    "observability, privacy, race_condition, reliability, testing_gap, validation. "
+    "Respond with exactly one compact JSON object: "
+    '{"found": bool, "category": "...", "file": "...", "evidence": "verbatim quote '
+    'from the context", "severity": "low|medium|high|critical", "next_action": '
+    '"approve|request_changes|block", "explanation": "one sentence", "test": "one '
+    'concrete test description"}. If nothing is clearly wrong, respond with '
+    "found: false and leave the other fields empty. Bias toward found: false unless "
+    "you are confident - a false alarm is worse than staying quiet here. No prose, "
+    "no markdown fences."
+)
+
+
+class BroadFinding(TypedDict):
+    category: str
+    file: str
+    evidence: str
+    severity: Risk
+    next_action: Action
+    explanation: str
+    test: str
+
+
+def broad_scan(client: OpenAI, case: Case) -> BroadFinding | None:
+    """Last-resort catch-all for cases where no offline detector fired.
+
+    Only runs when submission/detectors.py found zero candidates, so it
+    never adds cost to a case our pattern detectors already handle - it
+    exists so an entirely unanticipated hidden-set defect doesn't guarantee
+    a silent miss. Evidence is required to be a verbatim substring of the
+    supplied context; anything else is treated as a hallucination and
+    dropped.
+    """
+    context_text = "\n\n".join(
+        f"[{section.get('path', section['kind'])}]\n{section['content']}"
+        for section in case["context"]
+    )
+    user_content = f"title: {case['title']}\nbrief: {case['brief']}\n\n{context_text}"
+    data = None
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            response = client.chat.completions.create(
+                model=VERIFY_MODEL,
+                messages=[
+                    {"role": "system", "content": _BROAD_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                max_completion_tokens=300,
+                temperature=0,
+                extra_body={"project_id": os.environ["MERGE_GATEWAY_PROJECT_ID"]},
+            )
+            content = response.choices[0].message.content or ""
+        except Exception:
+            content = None
+        data = _parse(content) if content else None
+        if data is not None:
+            break
+        if attempt < _MAX_ATTEMPTS - 1:
+            time.sleep(_RETRY_DELAY_SECONDS * (attempt + 1))
+    if data is None or not data.get("found"):
+        return None
+    category = str(data.get("category") or "").strip()
+    file = str(data.get("file") or "").strip()
+    evidence = str(data.get("evidence") or "").strip()
+    severity = data.get("severity")
+    next_action = data.get("next_action")
+    if not category or not file or not evidence:
+        return None
+    if severity not in RISKS or next_action not in ACTIONS:
+        return None
+    if evidence.lower() not in context_text.lower():
+        return None
+    return {
+        "category": category,
+        "file": file,
+        "evidence": evidence,
+        "severity": severity,
+        "next_action": next_action,
+        "explanation": str(data.get("explanation") or "Flagged by the fallback scan.").strip(),
+        "test": str(data.get("test") or "Add a regression test for this defect.").strip(),
     }

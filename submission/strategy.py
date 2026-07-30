@@ -8,6 +8,12 @@ then passed to a single cheap Merge Gateway model call (verifier.py) that
 only rules out false positives and writes the explanation. This keeps
 model usage scoped to short, grounded snippets instead of the whole case,
 and keeps unconfirmed pattern matches out of the review.
+
+If no detector fires at all, a single broader fallback call (verifier.
+broad_scan) reads the whole case as a last resort, so a defect outside our
+known patterns doesn't guarantee a silent miss. It only runs on cases the
+detectors already produced nothing for, so it never adds cost to a case
+they handle.
 """
 
 from __future__ import annotations
@@ -18,7 +24,7 @@ from costhack.contract import ACTIONS, RISKS
 from costhack.schema import Action, Case, Finding, Review, Risk
 
 from . import detectors
-from .verifier import make_client, verify
+from .verifier import broad_scan, make_client, verify
 
 MAX_FINDINGS = 8
 
@@ -30,8 +36,12 @@ def review(case: Case) -> Review:
     risk: Risk = "low"
     action: Action = "approve"
 
-    if candidates and os.environ.get("MERGE_GATEWAY_API_KEY"):
-        client = make_client()
+    if not os.environ.get("MERGE_GATEWAY_API_KEY"):
+        return {"risk": risk, "findings": findings, "tests": tests, "next_action": action}
+
+    client = make_client()
+
+    if candidates:
         for candidate in candidates:
             if len(findings) >= MAX_FINDINGS:
                 break
@@ -59,6 +69,21 @@ def review(case: Case) -> Review:
                 risk = candidate.default_severity
             if ACTIONS.index(candidate.default_action) > ACTIONS.index(action):
                 action = candidate.default_action
+    else:
+        fallback = broad_scan(client, case)
+        if fallback is not None:
+            findings.append(
+                {
+                    "category": fallback["category"],
+                    "severity": fallback["severity"],
+                    "file": fallback["file"],
+                    "evidence": fallback["evidence"],
+                    "explanation": fallback["explanation"],
+                }
+            )
+            tests.append(fallback["test"])
+            risk = fallback["severity"]
+            action = fallback["next_action"]
 
     return {
         "risk": risk,
