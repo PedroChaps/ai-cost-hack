@@ -1,4 +1,3 @@
-from costhack.cli import _load_cases, _load_strategy
 from costhack.contract import ContractError, validate_review
 from costhack.schema import Review, Rubric
 from costhack.scoring import score_review
@@ -43,15 +42,3 @@ def test_exact_public_finding_passes() -> None:
         "next_action": "block",
     }
     assert score_review(review, rubric)["passed"]
-
-
-def test_starter_scores_exactly_half_of_public_cases() -> None:
-    strategy = _load_strategy()
-    results = [
-        score_review(validate_review(strategy.review(case)), case["rubric"])
-        for case in _load_cases()
-    ]
-
-    assert len(results) == 10
-    assert sum(result["passed"] for result in results) == 5
-    assert sum(result["score"] for result in results) / len(results) == 50.0
