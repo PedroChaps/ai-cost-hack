@@ -17,6 +17,7 @@ reliably re-derive from an isolated snippet.
 
 from __future__ import annotations
 
+import difflib
 import re
 from dataclasses import dataclass
 
@@ -170,7 +171,15 @@ _NOT_NULL_RE = re.compile(
 )
 
 
-def _find_unsafe_migration(section: ContextSection) -> Candidate | None:
+def _mentions_backfill_for(text: str, column: str) -> bool:
+    for match in re.finditer(r"(?i)backfill", text):
+        window = text[max(0, match.start() - 80) : match.end() + 80]
+        if column.lower() in window.lower():
+            return True
+    return False
+
+
+def _find_unsafe_migration(case: Case, section: ContextSection) -> Candidate | None:
     content = section["content"]
     match = _NOT_NULL_RE.search(content)
     if not match:
@@ -178,6 +187,9 @@ def _find_unsafe_migration(section: ContextSection) -> Candidate | None:
     if re.search(r"(?i)\bUPDATE\b", content) or re.search(r"(?i)\bDEFAULT\b", content):
         return None
     column = match.group(1) or match.group(2) or "the column"
+    other_text = "\n".join(other["content"] for other in case["context"] if other is not section)
+    if _mentions_backfill_for(content + "\n" + other_text, column):
+        return None
     lines = content.splitlines()
     line_index = content[: match.start()].count("\n")
     return Candidate(
@@ -676,6 +688,184 @@ def _find_nonatomic_counter(case: Case, section: ContextSection) -> Candidate | 
     )
 
 
+_SWALLOWED_EXCEPTION_RE = re.compile(
+    r"except\s+(?:\([\w.,\s]+\)|\w+)?\s*(?:as\s+\w+)?\s*:\s*\n\s*pass\b"
+)
+
+
+def _find_swallowed_exception(section: ContextSection) -> Candidate | None:
+    content = section["content"]
+    match = _SWALLOWED_EXCEPTION_RE.search(content)
+    if not match:
+        return None
+    lines = content.splitlines()
+    line_index = content[: match.start()].count("\n")
+    return Candidate(
+        category="observability",
+        file=_path(section),
+        evidence=lines[line_index].strip(),
+        snippet=_snippet(lines, line_index, span=3),
+        default_severity="high",
+        default_action="request_changes",
+        test_hint=(
+            "confirm that when this call raises an exception, the failure is logged "
+            "or re-raised, not silently swallowed"
+        ),
+    )
+
+
+_WHILE_TRUE_RE = re.compile(r"while\s+True\s*:")
+_RETRY_BOUND_HINT_RE = re.compile(r"(?i)max_attempts|max_retries|backoff|time\.sleep")
+
+
+def _find_unbounded_retry(section: ContextSection) -> Candidate | None:
+    content = section["content"]
+    match = _WHILE_TRUE_RE.search(content)
+    if not match:
+        return None
+    if not re.search(r"(?i)requests\.|\bhttp\b|\bapi\b", content):
+        return None
+    body_after = content[match.end() : match.end() + 400]
+    if _RETRY_BOUND_HINT_RE.search(body_after):
+        return None
+    lines = content.splitlines()
+    line_index = content[: match.start()].count("\n")
+    return Candidate(
+        category="reliability",
+        file=_path(section),
+        evidence=lines[line_index].strip(),
+        snippet=_snippet(lines, line_index, span=6),
+        default_severity="high",
+        default_action="request_changes",
+        test_hint=(
+            "simulate that the remote provider is down and confirm this loop gives up "
+            "after a bounded number of attempts with backoff, instead of retrying forever"
+        ),
+    )
+
+
+_JWT_NO_VERIFY_RE = re.compile(
+    r"jwt\.decode\([^)]*(?:verify_signature['\"]?\s*:\s*False|algorithms\s*=\s*\[\s*['\"]none['\"])",
+    re.IGNORECASE,
+)
+
+
+def _find_jwt_signature_not_verified(section: ContextSection) -> Candidate | None:
+    content = section["content"]
+    match = _JWT_NO_VERIFY_RE.search(content)
+    if not match:
+        return None
+    lines = content.splitlines()
+    line_index = content[: match.start()].count("\n")
+    return Candidate(
+        category="authentication",
+        file=_path(section),
+        evidence=lines[line_index].strip(),
+        snippet=_snippet(lines, line_index, span=3),
+        default_severity="critical",
+        default_action="block",
+        test_hint=(
+            "a forged token with an invalid signature must be rejected, not decoded "
+            "and trusted"
+        ),
+    )
+
+
+_OS_SYSTEM_CONCAT_RE = re.compile(r"os\.system\(\s*['\"][^'\"]*['\"]\s*\+\s*\w+")
+
+
+def _find_os_system_injection(section: ContextSection) -> Candidate | None:
+    content = section["content"]
+    match = _OS_SYSTEM_CONCAT_RE.search(content)
+    if not match:
+        return None
+    if not re.search(r"request\.(form|args|GET|POST|json|data)", content):
+        return None
+    lines = content.splitlines()
+    line_index = content[: match.start()].count("\n")
+    return Candidate(
+        category="injection",
+        file=_path(section),
+        evidence=lines[line_index].strip(),
+        snippet=_snippet(lines, line_index, span=3),
+        default_severity="critical",
+        default_action="block",
+        test_hint=(
+            "an input containing shell metacharacters must be rejected, not "
+            "concatenated into the command string"
+        ),
+    )
+
+
+_ANALYTICS_CALL_RE = re.compile(r"analytics\.(?:track|identify|capture)\(")
+_PII_FIELD_RE = re.compile(
+    r"['\"](?:ssn|card_number|credit_card|cvv|password)['\"]\s*:", re.IGNORECASE
+)
+
+
+def _find_pii_to_third_party(section: ContextSection) -> Candidate | None:
+    content = section["content"]
+    if not _ANALYTICS_CALL_RE.search(content):
+        return None
+    match = _PII_FIELD_RE.search(content)
+    if not match:
+        return None
+    lines = content.splitlines()
+    line_index = content[: match.start()].count("\n")
+    return Candidate(
+        category="privacy",
+        file=_path(section),
+        evidence=lines[line_index].strip(),
+        snippet=_snippet(lines, line_index, span=2),
+        default_severity="critical",
+        default_action="block",
+        test_hint=(
+            "check the payload actually sent to the third-party analytics provider "
+            "and confirm the sensitive field is redacted, not included"
+        ),
+    )
+
+
+_PKG_LINE_RE = re.compile(r"^([\w.\-]+)==([\d.]+)")
+_KNOWN_PACKAGES = [
+    "requests", "numpy", "pandas", "flask", "django", "boto3", "pyyaml",
+    "cryptography", "urllib3", "click", "sqlalchemy", "pillow", "jinja2",
+    "pytest", "aiohttp", "fastapi", "pydantic", "redis", "celery", "gunicorn",
+]
+
+
+def _find_typosquatted_dependency(section: ContextSection) -> Candidate | None:
+    # Flag only the primary manifest, not every derived lockfile entry for the
+    # same package - otherwise one typo produces one finding per file it's
+    # pinned in.
+    if "lock" in _path(section).lower():
+        return None
+    content = section["content"]
+    for line in content.splitlines():
+        pkg_match = _PKG_LINE_RE.match(line.strip())
+        if not pkg_match:
+            continue
+        name = pkg_match.group(1)
+        if name.lower() in _KNOWN_PACKAGES:
+            continue
+        close = difflib.get_close_matches(name.lower(), _KNOWN_PACKAGES, n=1, cutoff=0.82)
+        if not close:
+            continue
+        return Candidate(
+            category="dependency",
+            file=_path(section),
+            evidence=line.strip(),
+            snippet=content,
+            default_severity="high",
+            default_action="block",
+            test_hint=(
+                f"confirm this is really '{close[0]}' and not a typosquatted package - "
+                f"'{name}' is one edit away from the popular package '{close[0]}'"
+            ),
+        )
+    return None
+
+
 def _find_disabled_tls(section: ContextSection) -> Candidate | None:
     content = section["content"]
     match = re.search(r"verify\s*=\s*False", content)
@@ -890,7 +1080,7 @@ def find_candidates(case: Case) -> list[Candidate]:
         authentication = _find_missing_authentication(section)
         if authentication:
             candidates.append(authentication)
-        migration = _find_unsafe_migration(section)
+        migration = _find_unsafe_migration(case, section)
         if migration:
             candidates.append(migration)
         dropped_column = _find_dropped_column_still_in_use(case, section)
@@ -950,6 +1140,24 @@ def find_candidates(case: Case) -> list[Candidate]:
         silent_truncation = _find_silent_truncation(case, section)
         if silent_truncation:
             candidates.append(silent_truncation)
+        swallowed_exception = _find_swallowed_exception(section)
+        if swallowed_exception:
+            candidates.append(swallowed_exception)
+        unbounded_retry = _find_unbounded_retry(section)
+        if unbounded_retry:
+            candidates.append(unbounded_retry)
+        jwt_no_verify = _find_jwt_signature_not_verified(section)
+        if jwt_no_verify:
+            candidates.append(jwt_no_verify)
+        os_system_injection = _find_os_system_injection(section)
+        if os_system_injection:
+            candidates.append(os_system_injection)
+        pii_third_party = _find_pii_to_third_party(section)
+        if pii_third_party:
+            candidates.append(pii_third_party)
+        typosquat = _find_typosquatted_dependency(section)
+        if typosquat:
+            candidates.append(typosquat)
         timezone = _find_naive_timezone_migration(case, section)
         if timezone:
             candidates.append(timezone)

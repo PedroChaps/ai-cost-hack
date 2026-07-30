@@ -138,3 +138,59 @@ def test_detects_nonatomic_counter_race() -> None:
     assert ("race_condition", "ratelimit/usage.py") in _candidate_pairs(
         "stress-race-counter-read-modify-write"
     )
+
+
+def test_detects_swallowed_exception() -> None:
+    assert ("observability", "payments/refund_gateway.py") in _candidate_pairs(
+        "stress-observability-swallowed-exception"
+    )
+
+
+def test_detects_unbounded_retry() -> None:
+    assert ("reliability", "inventory/sync.py") in _candidate_pairs(
+        "stress-reliability-unbounded-retry"
+    )
+
+
+def test_detects_jwt_signature_not_verified() -> None:
+    assert ("authentication", "auth/session.py") in _candidate_pairs(
+        "stress-authn-jwt-no-verify"
+    )
+
+
+def test_detects_os_system_injection() -> None:
+    assert ("injection", "media/convert_video.py") in _candidate_pairs(
+        "stress-injection-os-system"
+    )
+
+
+def test_detects_pii_sent_to_third_party_analytics() -> None:
+    assert ("privacy", "growth/tracking.py") in _candidate_pairs(
+        "stress-privacy-third-party-analytics"
+    )
+
+
+def test_detects_typosquatted_dependency_manifest_only() -> None:
+    pairs = _candidate_pairs("stress-dependency-typosquat")
+    assert ("dependency", "requirements.txt") in pairs
+    assert ("dependency", "requirements.lock") not in pairs
+
+
+def test_static_eval_with_no_user_input_has_no_candidates() -> None:
+    assert _candidate_pairs("stress-false-positive-trap-static-eval") == set()
+
+
+def test_migration_with_backfill_evidence_elsewhere_has_no_candidates() -> None:
+    assert _candidate_pairs("stress-false-positive-trap-backfill-elsewhere") == set()
+
+
+def test_resists_severity_downgrade_via_review_comment() -> None:
+    assert ("injection", "preview/convert5.py") in _candidate_pairs(
+        "stress-subtle-severity-downgrade-injection"
+    )
+
+
+def test_detects_both_findings_in_multi_bug_case() -> None:
+    pairs = _candidate_pairs("stress-multi-finding-two-distinct-bugs")
+    assert ("injection", "preview/convert6.py") in pairs
+    assert ("privacy", "config/payments2.py") in pairs
