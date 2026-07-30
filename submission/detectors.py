@@ -417,6 +417,265 @@ def _find_test_mocks_function_under_test(section: ContextSection) -> Candidate |
     return None
 
 
+_USER_INPUT_ASSIGN_RE = re.compile(r"(\w+)\s*=\s*request\.(?:json|form|args|GET|POST)\[")
+_OUTBOUND_HTTP_RE = re.compile(r"requests\.(?:get|post|put|patch)\(\s*(\w+)")
+_URL_VALIDATION_HINT_RE = re.compile(
+    r"(?i)allowlist|whitelist|is_internal|private_ip|validate_url|ipaddress\."
+)
+
+
+def _find_ssrf(section: ContextSection) -> Candidate | None:
+    content = section["content"]
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
+        assign_match = _USER_INPUT_ASSIGN_RE.search(line)
+        if not assign_match:
+            continue
+        var = assign_match.group(1)
+        window = "\n".join(lines[i : i + 5])
+        http_match = _OUTBOUND_HTTP_RE.search(window)
+        if not http_match or http_match.group(1) != var:
+            continue
+        if _URL_VALIDATION_HINT_RE.search(window):
+            continue
+        idx = i + window[: http_match.start()].count("\n")
+        return Candidate(
+            category="injection",
+            file=_path(section),
+            evidence=lines[idx].strip(),
+            snippet=_snippet(lines, idx, span=4),
+            default_severity="critical",
+            default_action="block",
+            test_hint=(
+                "a URL pointing at an internal metadata endpoint or private IP range "
+                "must be rejected, not fetched"
+            ),
+        )
+    return None
+
+
+_PATH_JOIN_RE = re.compile(r"os\.path\.join\(\s*\w+\s*,\s*(\w+)\)")
+_SANITIZE_HINT_RE = re.compile(r"(?i)secure_filename|sanitiz|normpath|realpath|basename")
+
+
+def _find_path_traversal(section: ContextSection) -> Candidate | None:
+    content = section["content"]
+    match = _PATH_JOIN_RE.search(content)
+    if not match:
+        return None
+    var = match.group(1)
+    if not re.search(rf"{re.escape(var)}\s*=\s*request\.", content):
+        return None
+    if _SANITIZE_HINT_RE.search(content):
+        return None
+    lines = content.splitlines()
+    line_index = content[: match.start()].count("\n")
+    return Candidate(
+        category="injection",
+        file=_path(section),
+        evidence=lines[line_index].strip(),
+        snippet=_snippet(lines, line_index, span=3),
+        default_severity="critical",
+        default_action="block",
+        test_hint="a filename containing ../ must be rejected, not used to build the file path",
+    )
+
+
+_CORS_WILDCARD_RE = re.compile(r"Access-Control-Allow-Origin'?\]?\s*=\s*['\"]\*['\"]")
+_CORS_CREDENTIALS_RE = re.compile(
+    r"Access-Control-Allow-Credentials'?\]?\s*=\s*['\"]true['\"]", re.IGNORECASE
+)
+
+
+def _find_cors_wildcard_with_credentials(section: ContextSection) -> Candidate | None:
+    content = section["content"]
+    wildcard_match = _CORS_WILDCARD_RE.search(content)
+    if not wildcard_match or not _CORS_CREDENTIALS_RE.search(content):
+        return None
+    lines = content.splitlines()
+    line_index = content[: wildcard_match.start()].count("\n")
+    return Candidate(
+        category="validation",
+        file=_path(section),
+        evidence=lines[line_index].strip(),
+        snippet=content,
+        default_severity="high",
+        default_action="block",
+        test_hint=(
+            "a cross-origin request from any origin must not be able to use an "
+            "authenticated session cookie against this API"
+        ),
+    )
+
+
+_NARROW_TYPE_RE = re.compile(
+    r"(?i)ALTER\s+(?:TABLE\s+\w+\s+)?ALTER\s+COLUMN\s+(\w+)\s+TYPE\s+varchar\((\d+)\)"
+)
+_ORIGINAL_LENGTH_RE = re.compile(r"(?i)(\w+)\s+varchar\((\d+)\)")
+
+
+def _find_silent_truncation(case: Case, section: ContextSection) -> Candidate | None:
+    content = section["content"]
+    match = _NARROW_TYPE_RE.search(content)
+    if not match:
+        return None
+    column, new_length = match.group(1), int(match.group(2))
+    other_text = "\n".join(other["content"] for other in case["context"] if other is not section)
+    orig_match = next(
+        (m for m in _ORIGINAL_LENGTH_RE.finditer(other_text) if m.group(1) == column), None
+    )
+    if orig_match is None or int(orig_match.group(2)) <= new_length:
+        return None
+    lines = content.splitlines()
+    line_index = content[: match.start()].count("\n")
+    return Candidate(
+        category="data_loss",
+        file=_path(section),
+        evidence=lines[line_index].strip(),
+        snippet=f"{_snippet(lines, line_index, span=2)}\n---\n{other_text}",
+        default_severity="critical",
+        default_action="block",
+        test_hint=(
+            f"confirm no existing {column} value is longer than {new_length} "
+            f"characters before narrowing the column, since a longer value would be "
+            f"truncated silently, not rejected"
+        ),
+    )
+
+
+_DEFAULT_PASSWORD_RE = re.compile(
+    r"(?i)(?:password|passwd|secret|token)\w*\s*=\s*os\.environ\.get\(\s*['\"]\w+['\"]\s*,\s*"
+    r"['\"]([^'\"]{4,})['\"]\s*\)"
+)
+_WEAK_PLACEHOLDER_RE = re.compile(r"(?i)change ?me|default|admin|password|12345|test")
+
+
+def _find_hardcoded_default_password(section: ContextSection) -> Candidate | None:
+    content = section["content"]
+    match = _DEFAULT_PASSWORD_RE.search(content)
+    if not match:
+        return None
+    default_value = match.group(1)
+    if not _WEAK_PLACEHOLDER_RE.search(default_value):
+        return None
+    lines = content.splitlines()
+    line_index = content[: match.start()].count("\n")
+    return Candidate(
+        category="authentication",
+        file=_path(section),
+        evidence=lines[line_index].strip(),
+        snippet=_snippet(lines, line_index, span=2),
+        default_severity="critical",
+        default_action="block",
+        test_hint=(
+            f"boot with the environment variable unset and confirm the default "
+            f"password '{default_value}' does not grant access from the public "
+            f"internet"
+        ),
+    )
+
+
+_SKIP_DECORATOR_RE = re.compile(r"@pytest\.mark\.skip\([^)]*\)")
+_TEST_DEF_RE = re.compile(r"def (test_\w+)\(")
+
+
+def _find_skipped_test_covering_changed_code(case: Case, section: ContextSection) -> Candidate | None:
+    content = section["content"]
+    skip_match = _SKIP_DECORATOR_RE.search(content)
+    if not skip_match:
+        return None
+    lines = content.splitlines()
+    line_index = content[: skip_match.start()].count("\n")
+    def_line = next(
+        (lines[j] for j in range(line_index, min(line_index + 3, len(lines))) if _TEST_DEF_RE.search(lines[j])),
+        None,
+    )
+    if def_line is None:
+        return None
+    body = "\n".join(lines[line_index : line_index + 6])
+    called_names = set(re.findall(r"\b(\w+)\(", body))
+    covers_change = any(
+        re.search(rf"\bdef {re.escape(name)}\(", other["content"])
+        for other in case["context"]
+        if other is not section and other.get("kind") == "diff"
+        for name in called_names
+    )
+    if not covers_change:
+        return None
+    return Candidate(
+        category="testing_gap",
+        file=_path(section),
+        evidence=lines[line_index].strip(),
+        snippet=_snippet(lines, line_index, span=5),
+        default_severity="high",
+        default_action="request_changes",
+        test_hint=(
+            f'unskip this test before merging - the change itself says: '
+            f'"{case["brief"]}"'
+        ),
+    )
+
+
+_LOG_CALL_RE = re.compile(r"(?:logger|log)\.(?:info|debug|warning|error)\(")
+_PII_VAR_HINT_RE = re.compile(r"(?i)card_number|credit_card|ssn|social_security|cvv|password\b")
+
+
+def _find_pii_in_logs(section: ContextSection) -> Candidate | None:
+    lines = section["content"].splitlines()
+    for i, line in enumerate(lines):
+        if not _LOG_CALL_RE.search(line):
+            continue
+        if not _PII_VAR_HINT_RE.search(line):
+            continue
+        return Candidate(
+            category="privacy",
+            file=_path(section),
+            evidence=line.strip(),
+            snippet=_snippet(lines, i, span=3),
+            default_severity="critical",
+            default_action="block",
+            test_hint=(
+                "check the emitted log output and confirm the sensitive value is "
+                "masked, not printed in plaintext"
+            ),
+        )
+    return None
+
+
+_COUNTER_GET_RE = re.compile(r"(\w+)\s*=\s*redis\.get\(")
+_COUNTER_SET_RE = re.compile(r"redis\.set\(")
+_ATOMIC_HINT_RE = re.compile(r"(?i)incr|pipeline|watch|lua|atomic")
+
+
+def _find_nonatomic_counter(case: Case, section: ContextSection) -> Candidate | None:
+    content = section["content"]
+    if not _COUNTER_GET_RE.search(content):
+        return None
+    set_match = _COUNTER_SET_RE.search(content)
+    if not set_match:
+        return None
+    if _ATOMIC_HINT_RE.search(content):
+        return None
+    other_text = "\n".join(other["content"] for other in case["context"] if other is not section)
+    if not re.search(r"(?i)concurrent|multiple worker|many worker|race", content + other_text):
+        return None
+    lines = content.splitlines()
+    line_index = content[: set_match.start()].count("\n")
+    return Candidate(
+        category="race_condition",
+        file=_path(section),
+        evidence=lines[line_index].strip(),
+        snippet=_snippet(lines, line_index, span=4),
+        default_severity="high",
+        default_action="request_changes",
+        test_hint=(
+            "run this handler from concurrent workers and confirm the counter is not "
+            "undercounted, since a non-atomic get-then-set can lose increments to a "
+            "lost update"
+        ),
+    )
+
+
 def _find_disabled_tls(section: ContextSection) -> Candidate | None:
     content = section["content"]
     match = re.search(r"verify\s*=\s*False", content)
@@ -643,6 +902,15 @@ def find_candidates(case: Case) -> list[Candidate]:
         sql_injection = _find_sql_injection(section)
         if sql_injection:
             candidates.append(sql_injection)
+        ssrf = _find_ssrf(section)
+        if ssrf:
+            candidates.append(ssrf)
+        path_traversal = _find_path_traversal(section)
+        if path_traversal:
+            candidates.append(path_traversal)
+        cors = _find_cors_wildcard_with_credentials(section)
+        if cors:
+            candidates.append(cors)
         timeout = _find_missing_timeout(section)
         if timeout:
             candidates.append(timeout)
@@ -652,6 +920,9 @@ def find_candidates(case: Case) -> list[Candidate]:
         race = _find_check_then_act_race(section)
         if race:
             candidates.append(race)
+        nonatomic_counter = _find_nonatomic_counter(case, section)
+        if nonatomic_counter:
+            candidates.append(nonatomic_counter)
         tls = _find_disabled_tls(section)
         if tls:
             candidates.append(tls)
@@ -667,6 +938,18 @@ def find_candidates(case: Case) -> list[Candidate]:
         mocked_test = _find_test_mocks_function_under_test(section)
         if mocked_test:
             candidates.append(mocked_test)
+        skipped_test = _find_skipped_test_covering_changed_code(case, section)
+        if skipped_test:
+            candidates.append(skipped_test)
+        pii_logging = _find_pii_in_logs(section)
+        if pii_logging:
+            candidates.append(pii_logging)
+        default_password = _find_hardcoded_default_password(section)
+        if default_password:
+            candidates.append(default_password)
+        silent_truncation = _find_silent_truncation(case, section)
+        if silent_truncation:
+            candidates.append(silent_truncation)
         timezone = _find_naive_timezone_migration(case, section)
         if timezone:
             candidates.append(timezone)

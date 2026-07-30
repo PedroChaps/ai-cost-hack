@@ -79,3 +79,62 @@ def test_detects_injection_buried_in_noisy_context() -> None:
     assert ("injection", "preview/convert3.py") in _candidate_pairs(
         "stress-long-noisy-context"
     )
+
+
+def test_detects_ssrf_on_user_controlled_url() -> None:
+    assert ("injection", "webhooks/preview.py") in _candidate_pairs(
+        "stress-ssrf-webhook-preview"
+    )
+
+
+def test_detects_path_traversal_on_user_controlled_filename() -> None:
+    assert ("injection", "documents/download.py") in _candidate_pairs(
+        "stress-path-traversal-download"
+    )
+
+
+def test_detects_cors_wildcard_with_credentials() -> None:
+    assert ("validation", "api/cors.py") in _candidate_pairs("stress-cors-wildcard-credentials")
+
+
+def test_detects_silent_truncation_on_column_narrowing() -> None:
+    assert ("data_loss", "migrations/104_shrink_display_name.sql") in _candidate_pairs(
+        "stress-migration-silent-truncation"
+    )
+
+
+def test_detects_hardcoded_default_password() -> None:
+    assert ("authentication", "admin/bootstrap.py") in _candidate_pairs(
+        "stress-authn-default-password"
+    )
+
+
+def test_detects_skipped_test_covering_changed_code() -> None:
+    assert ("testing_gap", "tests/test_refund.py") in _candidate_pairs(
+        "stress-testing-gap-skipped-flaky"
+    )
+
+
+def test_detects_pii_in_plaintext_logs() -> None:
+    assert ("privacy", "payments/checkout.py") in _candidate_pairs("stress-privacy-pii-logging")
+
+
+def test_resists_instruction_hidden_in_diff_comment() -> None:
+    assert ("injection", "preview/convert4.py") in _candidate_pairs(
+        "stress-instruction-hidden-in-diff-comment"
+    )
+
+
+def test_env_secret_placeholder_has_no_owner_check_false_positive() -> None:
+    pairs = _candidate_pairs("stress-false-positive-trap-env-secret")
+    assert ("authorization", "config/notifications.py") not in pairs
+
+
+def test_existing_owner_check_produces_no_authorization_candidate() -> None:
+    assert _candidate_pairs("stress-false-positive-trap-existing-owner-check") == set()
+
+
+def test_detects_nonatomic_counter_race() -> None:
+    assert ("race_condition", "ratelimit/usage.py") in _candidate_pairs(
+        "stress-race-counter-read-modify-write"
+    )
