@@ -75,7 +75,8 @@ def _find_secrets(section: ContextSection) -> list[Candidate]:
                         default_action="request_changes",
                         test_hint=(
                             "secret scanning must reject this committed production "
-                            "credential before merge"
+                            "credential before merge, and the exposed credential must "
+                            "be rotated"
                         ),
                     )
                 )
@@ -84,7 +85,9 @@ def _find_secrets(section: ContextSection) -> list[Candidate]:
 
 
 _FETCH_RE = re.compile(r"(\w+)\s*=\s*[\w.]+\.get\(([^)]*)\)")
-_MUTATE_RE = re.compile(r"\.(delete|update|save|remove)\(")
+# Scoped to delete/remove only: update/save catch too many legitimate
+# write-backs (e.g. a race-condition fix-up) and turn into false positives.
+_MUTATE_RE = re.compile(r"\.(delete|remove)\(")
 _OWNER_HINT_RE = re.compile(
     r"(?i)owner|authoriz|permission|tenant_id|require_owner|current_user\.id\s*=="
 )
@@ -114,6 +117,50 @@ def _find_missing_owner_check(section: ContextSection) -> Candidate | None:
                     "rejected with 403, not performed"
                 ),
             )
+    return None
+
+
+_ROUTE_RE = re.compile(r"@\w+\.route\(")
+_AUTH_DECORATOR_RE = re.compile(r"@(?:require_auth|login_required|requires_auth|auth_required)\b")
+_AUTH_CALL_RE = re.compile(r"require_user\(|current_user\b|request\.user\b")
+_SENSITIVE_MUTATION_RE = re.compile(
+    r"\.role\s*=|is_admin\s*=|is_staff\s*=|\.password\s*=|\.permission\w*\s*="
+)
+
+
+def _find_missing_authentication(section: ContextSection) -> Candidate | None:
+    lines = section["content"].splitlines()
+    for i, line in enumerate(lines):
+        if not _ROUTE_RE.search(line):
+            continue
+        j = i
+        while j < len(lines) and not lines[j].lstrip().startswith("def "):
+            j += 1
+        if j >= len(lines):
+            continue
+        decorator_text = "\n".join(lines[i:j])
+        body_lines = []
+        k = j + 1
+        while k < len(lines) and lines[k].strip() and not lines[k].lstrip().startswith(("@", "def ")):
+            body_lines.append(lines[k])
+            k += 1
+        body_text = "\n".join(body_lines)
+        if _AUTH_DECORATOR_RE.search(decorator_text) or _AUTH_CALL_RE.search(body_text):
+            continue
+        if not _SENSITIVE_MUTATION_RE.search(body_text):
+            continue
+        return Candidate(
+            category="authentication",
+            file=_path(section),
+            evidence=lines[j].strip(),
+            snippet=_snippet(lines, j, span=4),
+            default_severity="critical",
+            default_action="block",
+            test_hint=(
+                "an unauthenticated request must be rejected with 401 before this "
+                "handler runs, not processed"
+            ),
+        )
     return None
 
 
@@ -147,6 +194,43 @@ def _find_unsafe_migration(section: ContextSection) -> Candidate | None:
     )
 
 
+_DROP_COLUMN_RE = re.compile(r"(?i)ALTER\s+TABLE\s+\w+\s+DROP\s+COLUMN\s+(\w+)")
+_BACKUP_HINT_RE = re.compile(r"(?i)backup|archive|export(?:ed)?\s+first|backfill")
+
+
+def _find_dropped_column_still_in_use(case: Case, section: ContextSection) -> Candidate | None:
+    content = section["content"]
+    match = _DROP_COLUMN_RE.search(content)
+    if not match:
+        return None
+    column = match.group(1)
+    other_text = "\n".join(other["content"] for other in case["context"] if other is not section)
+    # Only flag when something elsewhere in the case actually references the
+    # dropped column - otherwise this is an ordinary, safe cleanup.
+    if column.lower() not in other_text.lower():
+        return None
+    if _BACKUP_HINT_RE.search(content + other_text):
+        return None
+    sentences = re.split(r"(?<=[.!?])\s+", other_text)
+    fragment = next(
+        (s.strip() for s in sentences if column.lower() in s.lower()), other_text.strip()
+    )
+    lines = content.splitlines()
+    line_index = content[: match.start()].count("\n")
+    return Candidate(
+        category="data_loss",
+        file=_path(section),
+        evidence=lines[line_index].strip(),
+        snippet=f"{_snippet(lines, line_index, span=2)}\n---\n{other_text}",
+        default_severity="critical",
+        default_action="block",
+        test_hint=(
+            f"confirm nothing still reads {column} before dropping it - context: "
+            f'"{fragment}"'
+        ),
+    )
+
+
 def _find_shell_injection(section: ContextSection) -> Candidate | None:
     content = section["content"]
     if "shell=True" not in content:
@@ -168,6 +252,168 @@ def _find_shell_injection(section: ContextSection) -> Candidate | None:
                     "passed to the shell"
                 ),
             )
+    return None
+
+
+_SQL_FSTRING_RE = re.compile(r"f['\"]\s*(?:SELECT|INSERT|UPDATE|DELETE)\b.*\{", re.IGNORECASE)
+_DB_EXECUTE_RE = re.compile(r"\.(execute|execute_query|raw)\(")
+
+
+def _find_sql_injection(section: ContextSection) -> Candidate | None:
+    content = section["content"]
+    match = _SQL_FSTRING_RE.search(content)
+    if not match:
+        return None
+    if not _DB_EXECUTE_RE.search(content):
+        return None
+    lines = content.splitlines()
+    line_index = content[: match.start()].count("\n")
+    return Candidate(
+        category="injection",
+        file=_path(section),
+        evidence=lines[line_index].strip(),
+        snippet=_snippet(lines, line_index, span=4),
+        default_severity="critical",
+        default_action="block",
+        test_hint=(
+            "an input containing SQL metacharacters must be rejected, not concatenated "
+            "into the query"
+        ),
+    )
+
+
+_HTTP_CALL_RE = re.compile(r"requests\.(?:get|post|put|patch|delete)\(")
+
+
+def _find_missing_timeout(section: ContextSection) -> Candidate | None:
+    content = section["content"]
+    match = _HTTP_CALL_RE.search(content)
+    if not match:
+        return None
+    depth = 0
+    end = match.start()
+    for idx in range(match.start(), len(content)):
+        if content[idx] == "(":
+            depth += 1
+        elif content[idx] == ")":
+            depth -= 1
+            if depth == 0:
+                end = idx + 1
+                break
+    call_text = content[match.start() : end]
+    if re.search(r"\btimeout\s*=", call_text):
+        return None
+    lines = content.splitlines()
+    line_index = content[: match.start()].count("\n")
+    return Candidate(
+        category="reliability",
+        file=_path(section),
+        evidence=lines[line_index].strip(),
+        snippet=_snippet(lines, line_index, span=3),
+        default_severity="high",
+        default_action="request_changes",
+        test_hint=(
+            "simulate the gateway is slow to respond and confirm this call still "
+            "returns via its own timeout, not hanging the worker indefinitely"
+        ),
+    )
+
+
+_PRIV_HEADER_RE = re.compile(
+    r"request\.(?:headers|cookies|args|form)\.get\(\s*['\"]"
+    r"([^'\"]*(?:admin|role|permission|is_staff|superuser|privilege)[^'\"]*)['\"]",
+    re.IGNORECASE,
+)
+
+
+def _find_client_controlled_privilege_flag(section: ContextSection) -> Candidate | None:
+    content = section["content"]
+    match = _PRIV_HEADER_RE.search(content)
+    if not match:
+        return None
+    lines = content.splitlines()
+    line_index = content[: match.start()].count("\n")
+    return Candidate(
+        category="authorization",
+        file=_path(section),
+        evidence=lines[line_index].strip(),
+        snippet=_snippet(lines, line_index, span=4),
+        default_severity="critical",
+        default_action="block",
+        test_hint=(
+            "a forged header must not grant the full account or privileged response, "
+            "since the client fully controls this value"
+        ),
+    )
+
+
+_CHECK_RE = re.compile(r"if\s+(\w+)\.(\w+)\s*[<>=!]+\s*\w+\s*:")
+_LOCK_HINT_RE = re.compile(r"(?i)lock|for update|atomic|transaction|compare_and_swap|\bCAS\b")
+
+
+def _find_check_then_act_race(section: ContextSection) -> Candidate | None:
+    content = section["content"]
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
+        match = _CHECK_RE.search(line)
+        if not match:
+            continue
+        var, field = match.group(1), match.group(2)
+        window = lines[i : i + 5]
+        window_text = "\n".join(window)
+        mutate_match = re.search(rf"{re.escape(var)}\.{re.escape(field)}\s*[+\-]=", window_text)
+        if not mutate_match:
+            continue
+        if _LOCK_HINT_RE.search(window_text):
+            continue
+        idx = i + window_text[: mutate_match.start()].count("\n")
+        return Candidate(
+            category="race_condition",
+            file=_path(section),
+            evidence=lines[idx].strip(),
+            snippet=_snippet(lines, idx, span=4),
+            default_severity="high",
+            default_action="block",
+            test_hint=(
+                f"issue two concurrent requests against this check-then-act path and "
+                f"confirm {field} cannot go negative - a race here is exactly how you "
+                f"oversell inventory or double-spend a limited resource"
+            ),
+        )
+    return None
+
+
+_PATCH_RE = re.compile(r"@(?:mock\.)?patch\(['\"]([\w.]+)['\"]\)")
+
+
+def _find_test_mocks_function_under_test(section: ContextSection) -> Candidate | None:
+    lines = section["content"].splitlines()
+    for i, line in enumerate(lines):
+        patch_match = _PATCH_RE.search(line)
+        if not patch_match:
+            continue
+        target_name = patch_match.group(1).rsplit(".", 1)[-1]
+        j = i + 1
+        while j < len(lines) and not lines[j].lstrip().startswith("def "):
+            j += 1
+        if j >= len(lines):
+            continue
+        body = "\n".join(lines[j : j + 6])
+        if not re.search(rf"\b{re.escape(target_name)}\s*\(", body):
+            continue
+        return Candidate(
+            category="testing_gap",
+            file=_path(section),
+            evidence=line.strip(),
+            snippet=_snippet(lines, i, span=5),
+            default_severity="high",
+            default_action="request_changes",
+            test_hint=(
+                f"run this test against the real {target_name}, without mocking it, "
+                f"since mocking the function under test means the real implementation "
+                f"never executes"
+            ),
+        )
     return None
 
 
@@ -296,7 +542,9 @@ def _find_testing_gap(case: Case, section: ContextSection) -> Candidate | None:
     )
 
 
-_ADVISORY_RE = re.compile(r"([\w.\-]+)\s+versions?\s+below\s+([\d.]+)", re.IGNORECASE)
+_ADVISORY_RE = re.compile(
+    r"([\w.\-]+)\s+(?:versions?\s+below|prior\s+to|before)\s+([\d.]+)", re.IGNORECASE
+)
 _LOCKFILE_PKG_RE = re.compile(r"([\w.\-]+)==([\d.]+)")
 
 
@@ -330,9 +578,9 @@ def _find_vulnerable_transitive_dependency(case: Case) -> Candidate | None:
                     default_severity="high",
                     default_action="request_changes",
                     test_hint=(
-                        "exercise the vulnerable transitive code path (e.g. a nested "
-                        "archive attempting path traversal) and confirm it is blocked "
-                        "or the dependency is upgraded past the advisory"
+                        f"exercise the vulnerable code path described in the advisory "
+                        f"({advisory_section['content'].strip()}) and confirm it is "
+                        f"blocked, or that the dependency is upgraded past the advisory"
                     ),
                 )
     return None
@@ -380,12 +628,30 @@ def find_candidates(case: Case) -> list[Candidate]:
         owner_check = _find_missing_owner_check(section)
         if owner_check:
             candidates.append(owner_check)
+        authentication = _find_missing_authentication(section)
+        if authentication:
+            candidates.append(authentication)
         migration = _find_unsafe_migration(section)
         if migration:
             candidates.append(migration)
+        dropped_column = _find_dropped_column_still_in_use(case, section)
+        if dropped_column:
+            candidates.append(dropped_column)
         injection = _find_shell_injection(section)
         if injection:
             candidates.append(injection)
+        sql_injection = _find_sql_injection(section)
+        if sql_injection:
+            candidates.append(sql_injection)
+        timeout = _find_missing_timeout(section)
+        if timeout:
+            candidates.append(timeout)
+        privilege_header = _find_client_controlled_privilege_flag(section)
+        if privilege_header:
+            candidates.append(privilege_header)
+        race = _find_check_then_act_race(section)
+        if race:
+            candidates.append(race)
         tls = _find_disabled_tls(section)
         if tls:
             candidates.append(tls)
@@ -398,6 +664,9 @@ def find_candidates(case: Case) -> list[Candidate]:
         testing_gap = _find_testing_gap(case, section)
         if testing_gap:
             candidates.append(testing_gap)
+        mocked_test = _find_test_mocks_function_under_test(section)
+        if mocked_test:
+            candidates.append(mocked_test)
         timezone = _find_naive_timezone_migration(case, section)
         if timezone:
             candidates.append(timezone)
