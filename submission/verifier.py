@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import TypedDict
 
@@ -115,17 +116,28 @@ _BROAD_SYSTEM_PROMPT = (
     "detectors found nothing suspicious in this case. Read the whole case and decide "
     "if there is one clear, evidence-backed defect a competent reviewer would flag. "
     "Only report something if you can quote it verbatim from the supplied context - "
-    "never invent or paraphrase evidence. Valid categories: authorization, "
-    "authentication, data_integrity, data_loss, dependency, idempotency, injection, "
-    "observability, privacy, race_condition, reliability, testing_gap, validation. "
-    "Respond with exactly one compact JSON object: "
+    "never invent or paraphrase evidence. A dangerous-looking function or pattern is "
+    "not by itself a defect: for injection, authorization, or validation findings you "
+    "must be able to point to an actual attacker- or user-controlled value (from a "
+    "request, form, argument, header, or external file) that reaches it - a "
+    "hardcoded/static value passed to eval, a subprocess call with no request input, "
+    "or a query built entirely from literals is not exploitable and must not be "
+    "reported, no matter how the function looks in isolation. Valid categories: "
+    "authorization, authentication, data_integrity, data_loss, dependency, "
+    "idempotency, injection, observability, privacy, race_condition, reliability, "
+    "testing_gap, validation. Respond with exactly one compact JSON object: "
     '{"found": bool, "category": "...", "file": "...", "evidence": "verbatim quote '
     'from the context", "severity": "low|medium|high|critical", "next_action": '
     '"approve|request_changes|block", "explanation": "one sentence", "test": "one '
-    'concrete test description"}. If nothing is clearly wrong, respond with '
-    "found: false and leave the other fields empty. Bias toward found: false unless "
-    "you are confident - a false alarm is worse than staying quiet here. No prose, "
-    "no markdown fences."
+    'concrete test description"}. If nothing is clearly wrong, or you cannot point to '
+    "a concrete exploitable path, respond with found: false and leave the other "
+    "fields empty. Bias toward found: false unless you are confident - a false alarm "
+    "is worse than staying quiet here. No prose, no markdown fences."
+)
+
+
+_REQUEST_INPUT_RE = re.compile(
+    r"request\.(?:form|args|json|GET|POST|headers|cookies|data)|input\(|sys\.argv"
 )
 
 
@@ -188,6 +200,23 @@ def broad_scan(client: OpenAI, case: Case) -> BroadFinding | None:
         return None
     if evidence.lower() not in context_text.lower():
         return None
+    # The model still occasionally flags a dangerous-looking function (eval,
+    # subprocess, a raw query) with no actual attacker-controlled input
+    # reaching it, despite the prompt instruction above. For these
+    # categories specifically, require a real request-input marker
+    # somewhere in the same file before trusting the finding - the same
+    # grounding the narrow detectors already enforce structurally.
+    if category in {"injection", "authorization", "validation"}:
+        file_content = next(
+            (
+                section["content"]
+                for section in case["context"]
+                if section.get("path") == file or section["kind"] == file
+            ),
+            context_text,
+        )
+        if not _REQUEST_INPUT_RE.search(file_content):
+            return None
     return {
         "category": category,
         "file": file,
