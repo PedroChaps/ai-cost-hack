@@ -118,8 +118,8 @@ def _find_missing_owner_check(section: ContextSection) -> Candidate | None:
 
 
 _NOT_NULL_RE = re.compile(
-    r"(?i)ALTER\s+(?:TABLE\s+\w+\s+)?(?:ALTER|MODIFY)\s+COLUMN\s+\w+[^;]*SET\s+NOT\s+NULL"
-    r"|ADD\s+COLUMN\s+\w+\s+\w+.*NOT\s+NULL"
+    r"(?i)ALTER\s+(?:TABLE\s+\w+\s+)?(?:ALTER|MODIFY)\s+COLUMN\s+(\w+)[^;]*SET\s+NOT\s+NULL"
+    r"|ADD\s+COLUMN\s+(\w+)\s+\w+.*NOT\s+NULL"
 )
 
 
@@ -130,6 +130,7 @@ def _find_unsafe_migration(section: ContextSection) -> Candidate | None:
         return None
     if re.search(r"(?i)\bUPDATE\b", content) or re.search(r"(?i)\bDEFAULT\b", content):
         return None
+    column = match.group(1) or match.group(2) or "the column"
     lines = content.splitlines()
     line_index = content[: match.start()].count("\n")
     return Candidate(
@@ -140,8 +141,8 @@ def _find_unsafe_migration(section: ContextSection) -> Candidate | None:
         default_severity="high",
         default_action="request_changes",
         test_hint=(
-            "run this migration against an existing row that violates the new "
-            "constraint and confirm it is backfilled first, not just rejected"
+            f"run this migration against an existing row where {column} is NULL and "
+            f"confirm it is backfilled first, not just rejected by the constraint"
         ),
     )
 
@@ -184,7 +185,10 @@ def _find_disabled_tls(section: ContextSection) -> Candidate | None:
         snippet=_snippet(lines, line_index, span=3),
         default_severity="high",
         default_action="request_changes",
-        test_hint="a self-signed or untrusted certificate must be rejected, not accepted",
+        test_hint=(
+            "a connection presenting a self-signed certificate must be rejected, not "
+            "accepted"
+        ),
     )
 
 
@@ -212,8 +216,9 @@ def _find_idempotency_gap(section: ContextSection) -> Candidate | None:
         default_severity="high",
         default_action="block",
         test_hint=(
-            "deliver the same event twice and confirm the effect happens exactly once, "
-            "not once per delivery"
+            "deliver the same event twice and confirm exactly one effect happens - one "
+            "charge, one message, or one transfer, depending on what this handler does - "
+            "not one per delivery"
         ),
     )
 
@@ -236,6 +241,7 @@ def _find_tenant_missing_from_cache_key(case: Case, section: ContextSection) -> 
     )
     if "tenant" not in other_text.lower():
         return None
+    id_field = match.group(2)
     return Candidate(
         category="privacy",
         file=_path(section),
@@ -244,8 +250,8 @@ def _find_tenant_missing_from_cache_key(case: Case, section: ContextSection) -> 
         default_severity="high",
         default_action="block",
         test_hint=(
-            "two different tenants with the same underlying id must not be able to "
-            "read each other's cached data through this key"
+            f"two tenants with the same {id_field} must not be able to read each "
+            f"other's cached data through this key"
         ),
     )
 
@@ -332,6 +338,9 @@ def _find_vulnerable_transitive_dependency(case: Case) -> Candidate | None:
     return None
 
 
+_TIMEZONE_OWNER_RE = re.compile(r"(\w+)_timezone", re.IGNORECASE)
+
+
 def _find_naive_timezone_migration(case: Case, section: ContextSection) -> Candidate | None:
     content = section["content"]
     if not re.search(r"AT TIME ZONE\s*'UTC'", content, re.IGNORECASE):
@@ -343,6 +352,8 @@ def _find_naive_timezone_migration(case: Case, section: ContextSection) -> Candi
     )
     if "timezone" not in other_text.lower():
         return None
+    owner_match = _TIMEZONE_OWNER_RE.search(other_text) or _TIMEZONE_OWNER_RE.search(content)
+    owner = owner_match.group(1) if owner_match else "record"
     lines = content.splitlines()
     for i, line in enumerate(lines):
         if "TIME ZONE" in line.upper():
@@ -354,8 +365,9 @@ def _find_naive_timezone_migration(case: Case, section: ContextSection) -> Candi
                 default_severity="critical",
                 default_action="block",
                 test_hint=(
-                    "convert a record from a non-UTC zone and confirm the absolute "
-                    "instant is preserved, not shifted as if it were already UTC"
+                    f"convert a non-UTC {owner} and confirm the migration continues to "
+                    f"preserve instant equality with the original timestamp, not shift "
+                    f"it as if it were already UTC"
                 ),
             )
     return None

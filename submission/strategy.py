@@ -1,12 +1,13 @@
 """Offline pattern detection, escalated to a cheap model for verification.
 
 Zero-cost regex/structural detectors (detectors.py) scan case context for
-suspicious patterns and emit candidates. Each candidate's matched line plus
-neighboring context is then passed to a single cheap Merge Gateway model
-call (verifier.py) that confirms or rejects it and supplies severity,
-next_action, explanation, and a test. This keeps model usage scoped to
-short, grounded snippets instead of the whole case, and keeps unconfirmed
-pattern matches out of the review.
+suspicious patterns and emit candidates, each already carrying its
+severity, next_action, and test description, all derived from the actual
+matched code. Each candidate's matched line plus neighboring context is
+then passed to a single cheap Merge Gateway model call (verifier.py) that
+only rules out false positives and writes the explanation. This keeps
+model usage scoped to short, grounded snippets instead of the whole case,
+and keeps unconfirmed pattern matches out of the review.
 """
 
 from __future__ import annotations
@@ -53,7 +54,7 @@ def review(case: Case) -> Review:
                     "explanation": verdict["explanation"],
                 }
             )
-            tests.append(verdict["test"])
+            tests.append(candidate.test_hint)
             if RISKS.index(candidate.default_severity) > RISKS.index(risk):
                 risk = candidate.default_severity
             if ACTIONS.index(candidate.default_action) > ACTIONS.index(action):

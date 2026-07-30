@@ -2,11 +2,13 @@
 
 Each call confirms or rejects a single localized candidate instead of
 generating a whole review, which is a much narrower task and stays
-reliable on a small, cheap model. Severity and next_action are decided by
-the detector (see detectors.py), not the model: the model's only job is to
-rule out false positives and write the explanation and test in its own
-words, guided by a category-specific test_hint. All calls run through
-Merge Gateway per the challenge rule.
+reliable on a small, cheap model. Severity, next_action, and the test
+description are all decided deterministically by the detector (see
+detectors.py) from the actual matched code - not by the model. The model
+is given the detector's test_hint as context (it explains *why* the
+pattern is suspicious, which the snippet alone often doesn't convey) but
+its own output is only a confirm/reject decision plus an explanation. All
+calls run through Merge Gateway per the challenge rule.
 """
 
 from __future__ import annotations
@@ -25,20 +27,18 @@ _RETRY_DELAY_SECONDS = 0.5
 _SYSTEM_PROMPT = (
     "You verify one suspected software defect found by static pattern matching for a "
     "release-gate reviewer. You are given the suspected category, the file, a short code "
-    "or context snippet, and a hint describing the kind of verification test this defect "
-    "class normally needs. Decide whether this is a genuine, exploitable or harmful "
-    "defect rather than a false positive (for example: a placeholder value, dead code, or "
-    "a check that is actually present nearby). Respond with exactly one compact JSON "
-    'object: {"confirmed": bool, "explanation": "one sentence grounded in the snippet", '
-    '"test": "one concrete test description using the hint and specifics from the '
-    'snippet"}. No prose, no markdown fences.'
+    "or context snippet, and a hint describing why this pattern is normally a problem. "
+    "Decide whether this is a genuine, exploitable or harmful defect rather than a false "
+    "positive (for example: a placeholder value, dead code, or a check that is actually "
+    "present nearby but outside the snippet). Respond with exactly one compact JSON "
+    'object and nothing else, no trailing characters: {"confirmed": bool, "explanation": '
+    '"one sentence grounded in the snippet"}. No prose, no markdown fences.'
 )
 
 
 class Verdict(TypedDict):
     confirmed: bool
     explanation: str
-    test: str
 
 
 def make_client() -> OpenAI:
@@ -57,8 +57,15 @@ def _parse(content: str) -> dict[str, object] | None:
         cleaned = cleaned[first_newline + 1 :]
         if cleaned.endswith("```"):
             cleaned = cleaned[:-3]
+    cleaned = cleaned.strip()
+    start = cleaned.find("{")
+    if start == -1:
+        return None
+    # Some small models tack on stray trailing characters after a valid JSON
+    # object (e.g. an extra "]"). raw_decode parses just the object and
+    # ignores whatever comes after it, instead of rejecting the whole reply.
     try:
-        data = json.loads(cleaned.strip())
+        data, _ = json.JSONDecoder().raw_decode(cleaned[start:])
     except json.JSONDecodeError:
         return None
     return data if isinstance(data, dict) else None
@@ -69,7 +76,7 @@ def verify(
 ) -> Verdict | None:
     user_content = (
         f"case brief: {case_brief}\nsuspected category: {category}\nfile: {file}\n"
-        f"verification test hint: {test_hint}\nsnippet:\n{snippet}"
+        f"why this is normally a problem: {test_hint}\nsnippet:\n{snippet}"
     )
     data = None
     for attempt in range(_MAX_ATTEMPTS):
@@ -80,7 +87,7 @@ def verify(
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": user_content},
                 ],
-                max_completion_tokens=200,
+                max_completion_tokens=120,
                 temperature=0,
                 extra_body={"project_id": os.environ["MERGE_GATEWAY_PROJECT_ID"]},
             )
@@ -97,5 +104,4 @@ def verify(
     return {
         "confirmed": bool(data.get("confirmed")),
         "explanation": str(data.get("explanation") or "Confirmed by verification model.").strip(),
-        "test": str(data.get("test") or test_hint).strip(),
     }

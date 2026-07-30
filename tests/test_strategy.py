@@ -19,8 +19,6 @@ PUBLIC_CASES = cast(
 
 class ConfirmingCompletions:
     def create(self, **kwargs: object) -> object:
-        messages = cast("list[dict[str, str]]", kwargs["messages"])
-        user_content = messages[-1]["content"]
         assert kwargs["model"] == "amazon/nova-lite"
         assert kwargs["extra_body"] == {"project_id": "event-project"}
         return SimpleNamespace(
@@ -31,9 +29,6 @@ class ConfirmingCompletions:
                             {
                                 "confirmed": True,
                                 "explanation": "Confirmed against the supplied snippet.",
-                                "test": user_content.splitlines()[3].removeprefix(
-                                    "verification test hint: "
-                                ),
                             }
                         )
                     )
@@ -72,5 +67,5 @@ def test_confirmed_candidates_reach_full_recall_on_public_cases() -> None:
         for case in PUBLIC_CASES:
             result = validate_review(review(case))
             scored = score_review(result, case["rubric"])
-            assert not scored["missing"], f"{case['id']} missed a required finding"
-            assert scored["false_positives"] == 0, f"{case['id']} produced a false positive"
+            assert scored["score"] == 100.0, f"{case['id']} scored {scored['score']}: {scored}"
+            assert scored["passed"]
